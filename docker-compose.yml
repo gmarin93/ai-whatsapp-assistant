@@ -1,0 +1,71 @@
+services:
+  redis:
+    # Redis Stack bundles the RedisJSON + RediSearch modules that
+    # langgraph-checkpoint-redis (AsyncRedisSaver) requires for JSON.SET /
+    # FT.* commands. Plain redis:7-alpine lacks these and fails with
+    # "unknown command 'JSON.SET'".
+    image: redis/redis-stack-server:7.4.0-v3
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  api:
+    build: .
+    restart: unless-stopped
+    command: >
+      gunicorn app.main:app
+        --worker-class uvicorn.workers.UvicornWorker
+        --workers 4
+        --bind 0.0.0.0:8000
+        --timeout 30
+        --graceful-timeout 10
+    ports:
+      - "8000:8000"
+    env_file: ../.env
+    environment:
+      REDIS_URL: redis://redis:6379
+      # Inherit tracing vars from the host env if set (override .env if needed)
+      LANGCHAIN_TRACING_V2: ${LANGCHAIN_TRACING_V2:-false}
+      LANGCHAIN_API_KEY: ${LANGCHAIN_API_KEY:-}
+      LANGCHAIN_PROJECT: ${LANGCHAIN_PROJECT:-whatsapp-assistant}
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  worker:
+    build: .
+    restart: unless-stopped
+    command: arq app.worker.WorkerSettings
+    env_file: ../.env
+    environment:
+      REDIS_URL: redis://redis:6379
+      LANGCHAIN_TRACING_V2: ${LANGCHAIN_TRACING_V2:-false}
+      LANGCHAIN_API_KEY: ${LANGCHAIN_API_KEY:-}
+      LANGCHAIN_PROJECT: ${LANGCHAIN_PROJECT:-whatsapp-assistant}
+    volumes:
+      # Google Calendar OAuth — mounted (not baked into the image) so a
+      # refreshed token.json persists without rebuilding. Token is read-write
+      # because the library rewrites it on refresh; secrets stay read-only.
+      - ./credentials.json:/app/credentials.json:ro
+      - ./token.json:/app/token.json
+    depends_on:
+      redis:
+        condition: service_healthy
+    # Scale workers: docker compose up --scale worker=4
+    deploy:
+      replicas: 2
+
+volumes:
+  redis_data:

@@ -1,94 +1,185 @@
-"""LangChain tools for the WhatsApp agent."""
+"""LangChain tools for the WhatsApp agent.
+
+Search and email tools have been migrated to MCP servers (``app/mcp/``).
+This module now only exposes supplemental tools that are difficult to serve
+over stdio (e.g. Google Calendar, which requires OAuth state files on disk).
+
+Use ``get_supplemental_tools()`` to retrieve them; the main entry point
+(``app/main.py``) merges them with the MCP-backed tools at startup.
+"""
 
 import logging
 import os
-from html import escape
-from typing import Dict
 
-import sendgrid
-from langchain_core.tools import BaseTool, tool
-from sendgrid.helpers.mail import Content, Email, Mail, To
+from langchain_core.tools import BaseTool
+
+from app.config import get_settings
 
 logger = logging.getLogger(__name__)
 
-
-def get_tools() -> list[BaseTool]:
-    """Return tools to bind to the worker LLM."""
-    tools: list[BaseTool] = [send_email, search_web]
-    tools += _get_calendar_tools()
-    return tools
+CALENDAR_SCOPES = ["https://www.googleapis.com/auth/calendar"]
 
 
-# ── Email ────────────────────────────────────────────────────────────────────
+def get_supplemental_tools() -> list[BaseTool]:
+    """Return non-MCP, in-process tools (Google Calendar + reminders).
 
-@tool
-def send_email(subject: str, body_md: str) -> Dict[str, str]:
-    """Send an email. Uses SENDGRID_API_KEY. Body can be plain text or markdown-style."""
-    api_key = os.environ.get("SENDGRID_API_KEY")
-    if not api_key:
-        return {"status": "skipped", "detail": "SENDGRID_API_KEY not set"}
+    These run in-process (not over stdio) because they need on-disk OAuth state
+    (calendar) or the agent state + Redis pool (reminders). Calendar degrades to
+    an empty list gracefully when credentials are missing.
+    """
+    from app.agent.reminders import get_reminder_tools
 
-    from_addr = os.environ.get("SENDGRID_FROM_EMAIL", "arias.fex@gmail.com")
-    to_addr = os.environ.get("SENDGRID_TO_EMAIL", from_addr)
-
-    try:
-        safe = escape(body_md)
-        html = (
-            "<!DOCTYPE html><html><body style='font-family:ui-monospace,monospace;white-space:pre-wrap'>"
-            f"{safe}</body></html>"
-        )
-
-        sg = sendgrid.SendGridAPIClient(api_key=api_key)
-        from_email = Email(from_addr)
-        to_email = To(to_addr)
-        content = Content("text/html", html)
-        mail = Mail(from_email, to_email, subject, content).get()
-        response = sg.client.mail.send.post(request_body=mail)
-        return {"status": "sent", "http_status": str(response.status_code)}
-    except Exception as e:
-        logger.exception("Email send failed")
-        return {"status": "error", "detail": str(e)}
-
-
-# ── Web Search ───────────────────────────────────────────────────────────────
-
-@tool
-def search_web(query: str) -> str:
-    """Search the web for up-to-date information. Returns a summary of search results."""
-    from ddgs import DDGS
-
-    try:
-        ddgs = DDGS()
-        results = list(ddgs.text(query, max_results=5))
-        if not results:
-            return f"No search results found for '{query}'. I'll answer based on what I know."
-        formatted = []
-        for r in results:
-            title = r.get("title", "")
-            body = r.get("body", "")
-            href = r.get("href", "")
-            formatted.append(f"- {title}: {body} ({href})")
-        return "\n".join(formatted)
-    except Exception as e:
-        logger.warning("DDG search failed for '%s': %s — falling back to LLM knowledge", query, e)
-        return (
-            f"Web search unavailable right now (DDG error). "
-            f"Answer the user's question about '{query}' using your own knowledge, "
-            f"and let them know the answer might not reflect the very latest information."
-        )
+    return _get_calendar_tools() + get_reminder_tools()
 
 
 # ── Google Calendar ──────────────────────────────────────────────────────────
 
 def _get_calendar_tools() -> list[BaseTool]:
-    """Load Google Calendar tools. Returns empty list if credentials missing."""
-    try:
-        from langchain_google_community import CalendarToolkit
+    """Load Google Calendar tools using configurable credential paths.
 
-        toolkit = CalendarToolkit()
-        tools = toolkit.get_tools()
-        logger.info("Google Calendar tools loaded: %d tools", len(tools))
-        return tools
-    except Exception as e:
-        logger.warning("Google Calendar tools not available: %s", e)
+    Returns an empty list (never raises) when:
+      - the client secrets / token files are missing, or
+      - the cached token's refresh token is expired or revoked.
+
+    OAuth tokens for Google apps in "Testing" mode expire after 7 days; when
+    that happens, regenerate ``token.json`` locally (the consent flow opens a
+    browser) and the mounted volume will pick it up without a rebuild.
+    """
+    settings = get_settings()
+    creds_file = settings.google_credentials_file
+    token_file = settings.google_token_file
+
+    if not os.path.exists(creds_file):
+        logger.info(
+            "Google Calendar disabled — client secrets file %r not found", creds_file
+        )
         return []
+    if not os.path.exists(token_file):
+        logger.info(
+            "Google Calendar disabled — token file %r not found. Run the OAuth "
+            "flow locally to generate it.",
+            token_file,
+        )
+        return []
+
+    try:
+        from langchain_google_community.calendar.utils import (
+            build_calendar_service,
+            get_google_credentials,
+        )
+
+        credentials = get_google_credentials(
+            token_file=token_file,
+            client_secrets_file=creds_file,
+            scopes=CALENDAR_SCOPES,
+        )
+        service = build_calendar_service(credentials=credentials)
+        tools = _build_calendar_tools(service)
+        logger.info("Google Calendar tools loaded: %s", [t.name for t in tools])
+        return tools
+    except Exception as exc:
+        if "invalid_grant" in str(exc):
+            logger.warning(
+                "Google Calendar token %r is expired or revoked (invalid_grant). "
+                "Regenerate it locally and restart — the mounted volume will pick "
+                "up the new token.",
+                token_file,
+            )
+        else:
+            logger.warning("Google Calendar tools not available: %s", exc)
+        return []
+
+
+# We build our own thin tools over the Google Calendar API instead of using
+# langchain_google_community's CalendarToolkit: its SearchEvents tool asks the
+# LLM to pass a JSON *string* of calendar info and then ``json.loads`` it, which
+# blows up on any stray control character (e.g. a newline in a calendar's
+# description). These two tools are simpler, more reliable, and easier to demo.
+
+CALENDAR_TZ = "America/Costa_Rica"
+DEFAULT_CALENDAR_ID = "primary"
+
+
+def _to_iso(value: str) -> str:
+    """Normalise an ISO-8601 string to a TZ-aware ISO timestamp (assume CR tz)."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    dt = datetime.fromisoformat(value)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=ZoneInfo(CALENDAR_TZ))
+    return dt.isoformat()
+
+
+def _build_calendar_tools(service) -> list[BaseTool]:
+    from langchain_core.tools import StructuredTool
+
+    def list_calendar_events(start: str, end: str) -> str:
+        """List Google Calendar events between two times.
+
+        Args:
+            start: Start of the window, ISO-8601 in America/Costa_Rica
+                (e.g. "2026-06-17T00:00:00").
+            end: End of the window, ISO-8601 in America/Costa_Rica
+                (e.g. "2026-06-17T23:59:59").
+        """
+        try:
+            result = (
+                service.events()
+                .list(
+                    calendarId=DEFAULT_CALENDAR_ID,
+                    timeMin=_to_iso(start),
+                    timeMax=_to_iso(end),
+                    singleEvents=True,
+                    orderBy="startTime",
+                    maxResults=20,
+                )
+                .execute()
+            )
+        except Exception as exc:  # noqa: BLE001
+            return f"error: could not fetch events ({exc})"
+
+        items = result.get("items", [])
+        if not items:
+            return "No events found in that range."
+        lines = []
+        for e in items:
+            when = e["start"].get("dateTime", e["start"].get("date", ""))
+            lines.append(f"- {when}: {e.get('summary', '(no title)')}")
+        return "\n".join(lines)
+
+    def create_calendar_event(
+        summary: str,
+        start: str,
+        end: str,
+        description: str = "",
+        location: str = "",
+    ) -> str:
+        """Create a Google Calendar event.
+
+        Args:
+            summary: Event title.
+            start: Start time, ISO-8601 in America/Costa_Rica.
+            end: End time, ISO-8601 in America/Costa_Rica.
+            description: Optional event description.
+            location: Optional event location.
+        """
+        body = {
+            "summary": summary,
+            "description": description,
+            "location": location,
+            "start": {"dateTime": _to_iso(start), "timeZone": CALENDAR_TZ},
+            "end": {"dateTime": _to_iso(end), "timeZone": CALENDAR_TZ},
+        }
+        try:
+            created = service.events().insert(
+                calendarId=DEFAULT_CALENDAR_ID, body=body
+            ).execute()
+        except Exception as exc:  # noqa: BLE001
+            return f"error: could not create event ({exc})"
+        return f"Event created: {created.get('summary', summary)} — {created.get('htmlLink', '')}".strip(" —")
+
+    return [
+        StructuredTool.from_function(list_calendar_events),
+        StructuredTool.from_function(create_calendar_event),
+    ]

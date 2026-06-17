@@ -1,10 +1,14 @@
 import logging
+from typing import TYPE_CHECKING
 
 import httpx
 
 from app.agent.graph import WhatsAppAgent
 from app.config import get_settings
 from app.meta.client import WhatsAppClient
+
+if TYPE_CHECKING:
+    from langchain_core.tools import BaseTool
 
 logger = logging.getLogger(__name__)
 
@@ -19,10 +23,15 @@ def _error_detail(exc: Exception) -> str:
 
 
 class MessageHandler:
-    """Connects incoming WhatsApp text → LangGraph → outbound reply."""
+    """Connects incoming WhatsApp text → LangGraph agent → outbound reply.
 
-    def __init__(self) -> None:
-        self.agent = WhatsAppAgent()
+    Pass ``tools`` to inject MCP-backed (or any LangChain) tools into the
+    agent at startup rather than letting the agent discover them internally.
+    When ``tools`` is omitted the agent falls back to its own tool loading.
+    """
+
+    def __init__(self, tools: list["BaseTool"] | None = None) -> None:
+        self.agent = WhatsAppAgent(tools=tools)
         self.agent.build()
         self.whatsapp = WhatsAppClient()
 
@@ -33,6 +42,36 @@ class MessageHandler:
         allowed = {x.strip() for x in settings.allowed_wa_ids.split(",") if x.strip()}
         return wa_id in allowed
 
+    async def handle_audio(self, wa_id: str, media_id: str) -> None:
+        """Download a voice note, transcribe it, then process it like text."""
+        if not self._is_allowed(wa_id):
+            logger.warning("Ignored voice note from non-allowed wa_id=%s", wa_id)
+            return
+
+        try:
+            audio, mime = await self.whatsapp.download_media(media_id)
+            from app.agent.transcription import transcribe_audio
+
+            text = await transcribe_audio(audio, mime)
+        except Exception:
+            logger.exception("Failed to transcribe voice note from wa_id=%s", wa_id)
+            await self.whatsapp.send_text(
+                wa_id,
+                "Sorry, I couldn't process that voice note. Please try again or type your message.",
+            )
+            return
+
+        if not text:
+            await self.whatsapp.send_text(
+                wa_id, "I couldn't hear anything in that voice note — mind trying again?"
+            )
+            return
+
+        logger.info("Transcribed voice note from wa_id=%s (%d chars)", wa_id, len(text))
+        # Show the user what we heard (nice confirmation), then handle it as text.
+        await self.whatsapp.send_text(wa_id, f"🎤 _I heard:_ “{text}”")
+        await self.handle_text(wa_id, text)
+
     async def handle_text(self, wa_id: str, text: str) -> None:
         if not self._is_allowed(wa_id):
             logger.warning("Ignored message from non-allowed wa_id=%s", wa_id)
@@ -42,10 +81,24 @@ class MessageHandler:
         if not text:
             return
 
-        # TODO: handle /reset, /help commands before calling the agent
         if text.lower() == "/reset":
             await self.agent.reset_thread(wa_id)
             await self.whatsapp.send_text(wa_id, "Conversation reset.")
+            return
+
+        # Greetings / /menu / chat-open welcome → show the full capabilities menu.
+        from app.agent.menu import (
+            MENU_BODY,
+            MENU_BUTTON_TEXT,
+            MENU_ROWS,
+            MENU_SECTION_TITLE,
+            is_menu_trigger,
+        )
+
+        if is_menu_trigger(text):
+            await self.whatsapp.send_list(
+                wa_id, MENU_BODY, MENU_BUTTON_TEXT, MENU_ROWS, MENU_SECTION_TITLE
+            )
             return
 
         try:
