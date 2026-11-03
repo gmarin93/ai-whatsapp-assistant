@@ -11,14 +11,16 @@ Each worker process:
   5. Sends the AI reply via the WhatsApp Cloud API.
 """
 import logging
-
+import asyncio
+from uuid import uuid4
 from app.bootstrap import load_environment
+from app.services.redis_user_lock import RedisUserLock
 
 load_environment()
 
 from arq import ArqRedis, cron
 from arq.connections import RedisSettings
-
+from arq import Retry
 from app.config import get_settings
 
 logger = logging.getLogger(__name__)
@@ -26,37 +28,173 @@ logger = logging.getLogger(__name__)
 
 # ── Job ───────────────────────────────────────────────────────────────────────
 
-async def process_message(ctx: dict, wa_id: str, text: str) -> None:
-    """Dequeued job: run the agent and reply to the user."""
+
+async def process_message(
+    ctx: dict,
+    wa_id: str,
+    text: str,
+    message_id: str | None = None,
+) -> None:
+    """Process WhatsApp messages with Redis locking and optional n8n routing."""
     settings = get_settings()
     redis: ArqRedis = ctx["redis"]
     handler = ctx["handler"]
 
-    lock_key = f"whatsapp:lock:{wa_id}"
-    lock_ttl = settings.user_lock_ttl_seconds * 1000  # milliseconds for Redis SET PX
+    lock = RedisUserLock(
+        redis=redis,
+        wa_id=wa_id,
+        ttl_seconds=settings.user_lock_ttl_seconds,
+    )
 
-    # Per-user lock — skip if another worker is already processing this user.
-    acquired = await redis.set(lock_key, "1", px=lock_ttl, nx=True)
+    acquired = await lock.acquire()
+
     if not acquired:
         logger.warning(
-            "wa_id=%s already being processed by another worker; re-queuing", wa_id
-        )
-        # Re-enqueue with a short delay so the message isn't lost. The queue name
-        # MUST match WorkerSettings.queue_name, otherwise the job lands on the
-        # default queue and is never picked up by this worker.
-        await redis.enqueue_job(
-            "process_message",
+            "wa_id=%s already being processed; re-queuing",
             wa_id,
-            text,
-            _defer_by=2,
-            _queue_name=settings.arq_queue_name,
         )
+
+        try:
+            job = await redis.enqueue_job(
+                "process_message",
+                wa_id,
+                text,
+                message_id,
+                _defer_by=2,
+                _queue_name=settings.arq_queue_name,
+            )
+
+            if job is None:
+                logger.error(
+                    "ARQ did not create the deferred job: "
+                    "wa_id=%s, message_id=%s",
+                    wa_id,
+                    message_id,
+                )
+                raise Retry(defer=2)
+
+        except Retry:
+            raise
+
+        except Exception as exc:
+            logger.exception(
+                "Failed to re-queue busy user message: "
+                "wa_id=%s, message_id=%s",
+                wa_id,
+                message_id,
+            )
+            raise Retry(defer=2) from exc
+
         return
 
     try:
+        lock.start_renewal()
+
+        # Route selected users through n8n when the dispatcher is available.
+        dispatcher = ctx.get("n8n_dispatcher")
+
+        if dispatcher is not None and message_id:
+            try:
+                handled = await dispatcher.dispatch(
+                    message_id=message_id,
+                    wa_id=wa_id,
+                    text=text,
+                )
+
+            except RuntimeError as exc:
+                logger.exception(
+                    "n8n dispatch failed: message_id=%s",
+                    message_id,
+                )
+
+                # Retry only when the processing claim was removed.
+                deduplication = getattr(
+                    dispatcher,
+                    "deduplication",
+                    None,
+                )
+
+                if deduplication is None:
+                    logger.error(
+                        "Cannot retry n8n message without deduplication: %s",
+                        message_id,
+                    )
+                    raise
+
+                try:
+                    status = await deduplication.get_status(
+                        message_id,
+                    )
+
+                except Exception:
+                    logger.exception(
+                        "Cannot verify n8n message state: %s",
+                        message_id,
+                    )
+                    raise RuntimeError(
+                        "Cannot safely retry n8n message"
+                    ) from exc
+
+                if status is not None:
+                    logger.error(
+                        "n8n retry blocked because Redis still "
+                        "contains message_id=%s, status=%s",
+                        message_id,
+                        status,
+                    )
+                    raise
+
+                # ARQ handles the deferred retry and its attempt limit.
+                retry_attempt = ctx.get("job_try", 1)
+                retry_delay = min(retry_attempt * 5, 30)
+
+                logger.warning(
+                    "Scheduling n8n retry: "
+                    "message_id=%s, attempt=%s, delay=%ss",
+                    message_id,
+                    retry_attempt,
+                    retry_delay,
+                )
+
+                raise Retry(defer=retry_delay) from exc
+
+            if handled:
+                logger.info(
+                    "Message handled by n8n: message_id=%s",
+                    message_id,
+                )
+                return
+
+        # Preserve the original agent behavior for all other messages.
         await handler.handle_text(wa_id, text)
+
+    except asyncio.CancelledError:
+        if lock.lost:
+            logger.error(
+                "Message processing cancelled after losing Redis lock: "
+                "wa_id=%s, message_id=%s",
+                wa_id,
+                message_id,
+            )
+        raise
+
     finally:
-        await redis.delete(lock_key)
+        await lock.stop_renewal()
+
+        try:
+            released = await lock.release()
+
+            if not released:
+                logger.warning(
+                    "User lock ownership changed: wa_id=%s",
+                    wa_id,
+                )
+
+        except Exception:
+            logger.exception(
+                "Failed to release Redis user lock: wa_id=%s",
+                wa_id,
+            )
 
 
 async def process_audio(ctx: dict, wa_id: str, media_id: str) -> None:
@@ -124,21 +262,60 @@ async def daily_briefing(ctx: dict) -> None:
 
 # ── Startup / shutdown hooks ──────────────────────────────────────────────────
 
+
 async def startup(ctx: dict) -> None:
-    """Called once per worker process at launch."""
+    """Initialize the original agent and optional n8n integration."""
     from app.mcp.loader import init_mcp_pool
     from app.agent.tools import get_supplemental_tools
     from app.services.handler import MessageHandler
 
-    logger.info("[worker] Loading MCP tools …")
+    settings = get_settings()
+
+    logger.info("[worker] Loading MCP tools...")
     mcp_tools = await init_mcp_pool()
     supplemental = get_supplemental_tools()
     all_tools = mcp_tools + supplemental
 
     logger.info("[worker] Building agent with %d tool(s)", len(all_tools))
-    handler = MessageHandler(tools=all_tools)
 
+    handler = MessageHandler(tools=all_tools)
     ctx["handler"] = handler
+
+    # Keep the original workflow unchanged when n8n is disabled.
+    ctx["n8n_dispatcher"] = None
+
+    if settings.n8n_enabled:
+        from app.meta.client import WhatsAppClient
+        from app.services.n8n_client import N8NClient
+        from app.services.n8n_deduplication import N8NDeduplication
+        from app.services.n8n_dispatcher import N8NDispatcher
+
+        logger.info("[worker] Initializing n8n integration")
+
+        redis = ctx["redis"]
+
+        n8n_client = N8NClient(
+            webhook_url=settings.n8n_webhook_url,
+            api_key=settings.n8n_api_key,
+            timeout=settings.n8n_timeout_seconds,
+        )
+
+        deduplication = N8NDeduplication(
+            redis=redis,
+            ttl_seconds=300,
+        )
+
+        whatsapp_client = WhatsAppClient()
+
+        ctx["n8n_dispatcher"] = N8NDispatcher(
+            settings=settings,
+            n8n_client=n8n_client,
+            send_reply=whatsapp_client.send_text,
+            deduplication=deduplication,
+        )
+
+        logger.info("[worker] n8n integration initialized")
+
     logger.info("[worker] Ready")
 
 

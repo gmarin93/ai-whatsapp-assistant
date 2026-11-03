@@ -10,7 +10,14 @@ class Settings(BaseSettings):
         env_file=str(PROJECT_DIR / ".env"),
         env_file_encoding="utf-8",
         extra="ignore",
+
     )
+    # Optional n8n integration
+    n8n_enabled: bool = False
+    n8n_webhook_url: str = ""
+    n8n_api_key: str = ""
+    n8n_allowed_wa_ids: str = ""
+    n8n_timeout_seconds: float = 30.0
 
     whatsapp_access_token: str = ""
     whatsapp_phone_number_id: str = ""
