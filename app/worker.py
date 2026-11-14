@@ -34,9 +34,16 @@ async def process_message(
     wa_id: str,
     text: str,
     message_id: str | None = None,
+    phone_number_id: str | None = None,
 ) -> None:
     """Process WhatsApp messages with Redis locking and optional n8n routing."""
     settings = get_settings()
+    if phone_number_id:
+        logger.info(
+            "Processing WhatsApp message: phone_number_id=%s, message_id=%s",
+            phone_number_id,
+            message_id,
+    )
     redis: ArqRedis = ctx["redis"]
     handler = ctx["handler"]
 
@@ -95,10 +102,11 @@ async def process_message(
 
         if dispatcher is not None and message_id:
             try:
-                handled = await dispatcher.dispatch(
+               handled = await dispatcher.dispatch(
                     message_id=message_id,
                     wa_id=wa_id,
                     text=text,
+                    phone_number_id=phone_number_id
                 )
 
             except RuntimeError as exc:

@@ -3,7 +3,7 @@ from app.config import Settings
 
 
 def should_route_to_n8n(wa_id: str, settings: Settings) -> bool:
-    """Return True only when n8n is enabled and the sender is authorized."""
+    """Determine whether an incoming WhatsApp message should use n8n."""
 
     if not settings.n8n_enabled:
         return False
@@ -14,13 +14,21 @@ def should_route_to_n8n(wa_id: str, settings: Settings) -> bool:
     if not settings.n8n_webhook_url or not settings.n8n_api_key:
         return False
 
-    allowed_users = {
-        user.strip()
-        for user in settings.n8n_allowed_wa_ids.split(",")
-        if user.strip()
-    }
+    routing_mode = settings.n8n_routing_mode.strip().lower()
 
-    if not allowed_users:
+    if routing_mode == "disabled":
         return False
 
-    return wa_id.strip() in allowed_users
+    if routing_mode == "all":
+        return True
+
+    if routing_mode == "allowlist":
+        allowed_users = {
+            user.strip()
+            for user in settings.n8n_allowed_wa_ids.split(",")
+            if user.strip()
+        }
+
+        return wa_id.strip() in allowed_users
+
+    return False

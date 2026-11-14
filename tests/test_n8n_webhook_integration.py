@@ -130,11 +130,51 @@ async def test_webhook_passes_message_id_to_arq(arq_pool):
         "50688888888",
         "Hello from Meta",
         message_id,
+        "",
         _job_id=f"whatsapp:{message_id}",
         _queue_name="whatsapp:jobs",
     )
 
     arq_pool.eval.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_webhook_passes_phone_number_id_to_arq(arq_pool):
+    """Forward the receiving WhatsApp channel ID to ARQ."""
+    message_id = "wamid.channel-001"
+    phone_number_id = "123456789"
+
+    arq_pool.set.return_value = True
+    arq_pool.enqueue_job.return_value = object()
+
+    payload = build_payload(
+        message_id,
+        text="Hello from business channel",
+    )
+
+    payload["entry"][0]["changes"][0]["value"]["metadata"] = {
+        "phone_number_id": phone_number_id,
+    }
+
+    with patch.object(
+        whatsapp,
+        "_validate_signature",
+        return_value=True,
+    ):
+        response = await post_webhook(payload)
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+
+    arq_pool.enqueue_job.assert_awaited_once_with(
+        "process_message",
+        "50688888888",
+        "Hello from business channel",
+        message_id,
+        phone_number_id,
+        _job_id=f"whatsapp:{message_id}",
+        _queue_name="whatsapp:jobs",
+    )
 
 
 @pytest.mark.asyncio
@@ -186,7 +226,6 @@ async def test_webhook_preserves_deduplication_when_enqueue_fails(
     arq_pool.delete.assert_not_awaited()
 
 
-
 @pytest.mark.asyncio
 async def test_duplicate_message_is_not_enqueued(arq_pool):
     """Skip duplicate messages when ARQ confirms the job exists."""
@@ -227,7 +266,6 @@ async def test_duplicate_message_is_not_enqueued(arq_pool):
     arq_pool.eval.assert_not_awaited()
 
 
-
 @pytest.mark.asyncio
 async def test_enqueue_uses_deterministic_job_id(arq_pool):
     """Verify that the webhook creates a stable ARQ job ID."""
@@ -264,6 +302,7 @@ async def test_enqueue_uses_deterministic_job_id(arq_pool):
         wa_id,
         "Hello",
         message_id,
+        "",
         _job_id=f"whatsapp:{message_id}",
         _queue_name=settings.arq_queue_name,
     )
@@ -302,6 +341,7 @@ async def test_existing_arq_job_does_not_return_error(arq_pool):
         "50688888888",
         "Hello",
         message_id,
+        "",
         _job_id=f"whatsapp:{message_id}",
         _queue_name=settings.arq_queue_name,
     )
@@ -463,7 +503,6 @@ async def test_enqueue_failure_with_existing_job_keeps_claim(
 
     # Keep the claim when ARQ confirms that the job exists.
     arq_pool.eval.assert_not_awaited()
-
 
 
 @pytest.mark.asyncio

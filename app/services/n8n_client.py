@@ -19,7 +19,9 @@ class N8NClient:
         api_key: str,
         timeout: float = 30.0,
     ) -> None:
-        if not webhook_url or not webhook_url.startswith(("http://", "https://")):
+        if not webhook_url or not webhook_url.startswith(
+            ("http://", "https://")
+        ):
             raise ValueError("A valid n8n webhook URL is required")
 
         if not api_key:
@@ -37,17 +39,23 @@ class N8NClient:
         message_id: str,
         wa_id: str,
         text: str,
+        phone_number_id: str | None = None,
     ) -> str:
-        """Request an AI reply from n8n without sending it to WhatsApp."""
+        """Request an AI reply from n8n with WhatsApp channel metadata."""
 
         if not message_id or not wa_id or not text.strip():
-            raise ValueError("Message ID, WhatsApp ID and text are required")
+            raise ValueError(
+                "Message ID, WhatsApp ID and text are required"
+            )
 
         payload = {
             "message_id": message_id,
             "wa_id": wa_id,
             "text": text,
         }
+
+        if phone_number_id:
+            payload["phone_number_id"] = phone_number_id
 
         headers = {
             "X-N8N-API-KEY": self.api_key,
@@ -70,7 +78,9 @@ class N8NClient:
             reply = data.get("reply")
 
             if not isinstance(reply, str) or not reply.strip():
-                raise N8NClientError("n8n returned an empty or invalid reply")
+                raise N8NClientError(
+                    "n8n returned an empty or invalid reply"
+                )
 
             return reply.strip()
 
@@ -79,11 +89,15 @@ class N8NClient:
             raise N8NClientError("n8n request timed out") from exc
 
         except httpx.HTTPError as exc:
-            logger.error("n8n HTTP request failed: %s", type(exc).__name__)
+            logger.error(
+                "n8n HTTP request failed: %s",
+                type(exc).__name__,
+            )
             raise N8NClientError("n8n HTTP request failed") from exc
 
         except ValueError as exc:
             if isinstance(exc, N8NClientError):
                 raise
+
             logger.error("n8n returned invalid JSON")
             raise N8NClientError("n8n returned invalid JSON") from exc

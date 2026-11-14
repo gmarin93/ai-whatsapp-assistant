@@ -23,11 +23,18 @@ def test_parse_audio_without_id_is_dropped():
     assert _parse_message(msg) is None
 
 
-def test_extract_messages_routes_audio():
+def test_extract_messages_routes_audio():   
     payload = {"entry": [{"changes": [{"value": {"messages": [
         {"id": "wamid.9", "from": "123", "type": "audio", "audio": {"id": "M1"}}
     ]}}]}]}
-    assert _extract_messages(payload) == [{"id": "wamid.9", "wa_id": "123", "audio_id": "M1"}]
+    assert _extract_messages(payload) == [
+        {
+            "id": "wamid.9",
+            "wa_id": "123",
+            "audio_id": "M1",
+            "phone_number_id": "",
+        }
+    ]
 
 
 # ── transcription: correct filename + returns text (OpenAI mocked) ────────────

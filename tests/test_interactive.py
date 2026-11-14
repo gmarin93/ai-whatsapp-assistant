@@ -114,5 +114,10 @@ def test_extract_messages_handles_tap_payload():
     }
     out = _extract_messages(payload)
     assert out == [
-        {"id": "wamid.1", "wa_id": "50660050800", "text": menu.MENU_EXPANSIONS["menu_reminder"]}
+        {
+            "id": "wamid.1",
+            "wa_id": "50660050800",
+            "text": menu.MENU_EXPANSIONS["menu_reminder"],
+            "phone_number_id": "",
+        }
     ]

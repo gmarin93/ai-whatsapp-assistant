@@ -197,23 +197,28 @@ def _parse_message(
     )
 
 
+
 def _extract_messages(
     payload: dict[str, Any],
 ) -> list[dict[str, Any]]:
-    """Extract supported WhatsApp messages from a Meta webhook payload."""
+    """Extract supported WhatsApp messages with channel metadata."""
     results: list[dict[str, Any]] = []
 
     for entry in payload.get("entry", []):
         for change in entry.get("changes", []):
             value = change.get("value", {})
+            metadata = value.get("metadata", {})
+            phone_number_id = metadata.get("phone_number_id", "")
 
             for message in value.get("messages", []):
                 parsed = _parse_message(message)
 
                 if parsed:
+                    parsed["phone_number_id"] = phone_number_id
                     results.append(parsed)
 
     return results
+
 
 
 async def _claim_message(msg_id: str) -> str | None:
@@ -353,15 +358,18 @@ async def receive_webhook(
                         _job_id=f"whatsapp:{msg_id}",
                         _queue_name=settings.arq_queue_name,
                     )
+               
                 else:
                     job = await _arq_pool.enqueue_job(
                         "process_message",
                         wa_id,
                         msg["text"],
                         msg_id,
+                        msg.get("phone_number_id"),
                         _job_id=f"whatsapp:{msg_id}",
                         _queue_name=settings.arq_queue_name,
                     )
+
 
                 if job is None:
                     # ARQ already has a job with this message ID.

@@ -6,6 +6,7 @@ from app.config import Settings
 from app.services.n8n_client import N8NClient
 from app.services.n8n_deduplication import N8NDeduplication
 from app.services.n8n_router import should_route_to_n8n
+from app.services.tenant_resolver import TenantResolver
 
 logger = logging.getLogger(__name__)
 
@@ -24,14 +25,40 @@ class N8NDispatcher:
         self.n8n_client = n8n_client
         self.send_reply = send_reply
         self.deduplication = deduplication
+        self.tenant_resolver = TenantResolver(settings)
 
     async def dispatch(
         self,
         message_id: str,
         wa_id: str,
         text: str,
+        phone_number_id: str | None = None,
     ) -> bool:
         """Return True when the message belongs to the n8n integration."""
+        
+        if phone_number_id is not None:
+            tenant = self.tenant_resolver.resolve(phone_number_id)
+
+            if tenant is None:
+                logger.warning(
+                    "WhatsApp message blocked: unknown channel, "
+                    "phone_number_id=%s, message_id=%s",
+                    phone_number_id,
+                    message_id,
+                )
+                return True
+
+            logger.info(
+                "WhatsApp channel resolved: tenant_id=%s, "
+                "phone_number_id=%s, message_id=%s",
+                tenant.tenant_id,
+                tenant.phone_number_id,
+                message_id,
+            )
+
+        if not should_route_to_n8n(wa_id, self.settings):
+            return False
+
         if not should_route_to_n8n(wa_id, self.settings):
             return False
 
@@ -69,6 +96,7 @@ class N8NDispatcher:
                 message_id=message_id,
                 wa_id=wa_id,
                 text=text,
+                phone_number_id=phone_number_id,
             )
 
         except Exception as exc:

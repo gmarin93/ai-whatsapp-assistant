@@ -17,6 +17,7 @@ class Settings(BaseSettings):
     n8n_webhook_url: str = ""
     n8n_api_key: str = ""
     n8n_allowed_wa_ids: str = ""
+    n8n_routing_mode: str = "allowlist"
     n8n_timeout_seconds: float = 30.0
 
     whatsapp_access_token: str = ""

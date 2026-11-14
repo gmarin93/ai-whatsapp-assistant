@@ -192,6 +192,7 @@ async def test_n8n_handled_message_skips_original_agent():
         message_id="wamid.n8n-001",
         wa_id="50688888888",
         text="Hello",
+        phone_number_id=None,
     )
 
     handler.handle_text.assert_not_awaited()
@@ -226,6 +227,7 @@ async def test_n8n_unhandled_message_uses_original_agent():
         message_id="wamid.original-001",
         wa_id="50677777777",
         text="Hello",
+        phone_number_id=None,
     )
 
     handler.handle_text.assert_awaited_once_with(
@@ -269,6 +271,7 @@ async def test_n8n_failure_schedules_retry_when_claim_released():
         message_id="wamid.retry-001",
         wa_id="50688888888",
         text="Hello",
+        phone_number_id=None,
     )
 
     dispatcher.deduplication.get_status.assert_awaited_once_with(

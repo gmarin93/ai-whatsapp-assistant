@@ -11,6 +11,7 @@ def make_settings(**overrides):
     """Create isolated settings for dispatcher tests."""
     values = {
         "n8n_enabled": True,
+        "n8n_routing_mode": "allowlist",
         "n8n_webhook_url": "http://localhost:5678/webhook/test",
         "n8n_api_key": "test-secret",
         "n8n_allowed_wa_ids": "50688888888",
@@ -32,17 +33,22 @@ def make_dispatcher(settings=None, with_deduplication=True):
         ],
     }
 
-    deduplication = AsyncMock() if with_deduplication else None
+    if settings is None:
+        settings = make_settings()
 
-    if deduplication is not None:
+    deduplication = None
+
+    if with_deduplication:
+        deduplication = AsyncMock()
         deduplication.acquire.return_value = "owner-token"
-        deduplication.release_processing.return_value = True
         deduplication.begin_send.return_value = True
         deduplication.complete.return_value = True
+        deduplication.release_processing.return_value = True
         deduplication.mark_unknown.return_value = True
+        deduplication.get_status.return_value = None
 
     dispatcher = N8NDispatcher(
-        settings=settings if settings is not None else make_settings(),
+        settings=settings,
         n8n_client=client,
         send_reply=send_reply,
         deduplication=deduplication,
@@ -91,6 +97,7 @@ async def test_authorized_user():
         message_id="msg-001",
         wa_id="50688888888",
         text="Hello",
+        phone_number_id=None,
     )
 
     dedup.begin_send.assert_awaited_once_with(
@@ -363,3 +370,48 @@ async def test_invalid_meta_response_marks_message_as_unknown():
 
     dedup.complete.assert_not_awaited()
     dedup.release_processing.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_dispatch_passes_phone_number_id():
+    dispatcher, client, send_reply, dedup = make_dispatcher()
+
+    phone_number_id = "123456789"
+
+    # Configure the registered WhatsApp channel for this test.
+    dispatcher.settings.whatsapp_phone_number_id = phone_number_id
+
+    result = await dispatcher.dispatch(
+        message_id="msg-tenant-001",
+        wa_id="50688888888",
+        text="Hello",
+        phone_number_id=phone_number_id,
+    )
+
+    assert result is True
+
+    client.generate_reply.assert_awaited_once_with(
+        message_id="msg-tenant-001",
+        wa_id="50688888888",
+        text="Hello",
+        phone_number_id=phone_number_id,
+    )
+
+
+@pytest.mark.asyncio
+async def test_dispatch_blocks_unknown_channel():
+    dispatcher, client, send_reply, dedup = make_dispatcher()
+
+    dispatcher.settings.whatsapp_phone_number_id = "123456789"
+
+    result = await dispatcher.dispatch(
+        message_id="msg-unknown-001",
+        wa_id="50688888888",
+        text="Hello",
+        phone_number_id="999999999",
+    )
+
+    assert result is True
+    client.generate_reply.assert_not_awaited()
+    send_reply.assert_not_awaited()
+    dedup.acquire.assert_not_awaited()

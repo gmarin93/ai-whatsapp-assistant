@@ -61,11 +61,12 @@ async def test_authorized_message_end_to_end():
             "wamid.incoming-001",
         )
 
-    n8n_client.generate_reply.assert_awaited_once_with(
-        message_id="wamid.incoming-001",
-        wa_id="50688888888",
-        text="Hello",
-    )
+        n8n_client.generate_reply.assert_awaited_once_with(
+            message_id="wamid.incoming-001",
+            wa_id="50688888888",
+            text="Hello",
+            phone_number_id=None,
+        )
 
     send_reply.assert_awaited_once_with(
         "50688888888",
